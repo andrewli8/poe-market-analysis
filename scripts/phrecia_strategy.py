@@ -4,10 +4,11 @@ import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 START_DATE = date(2025, 2, 20)
 END_DATE = date(2025, 3, 20)
+FIRST_WEEK_END = START_DATE + timedelta(days=6)
 CSV_DELIMITER = ";"
 
 ANALYSIS_DIR = Path("analysis")
@@ -17,9 +18,11 @@ STRATEGY_DIR = ANALYSIS_DIR / "strategy"
 CURRENCY_INPUT = FILTERED_DIR / "Phrecia.currency.filtered.csv"
 ITEMS_INPUT = FILTERED_DIR / "Phrecia.items.filtered.csv"
 
-STRATEGY_DAILY_OUTPUT = STRATEGY_DIR / "strategy_daily.csv"
-STRATEGY_TRADES_OUTPUT = STRATEGY_DIR / "strategy_trades.csv"
-STRATEGY_SUMMARY_OUTPUT = STRATEGY_DIR / "strategy_summary.csv"
+BEST_DAILY_OUTPUT = STRATEGY_DIR / "best_daily.csv"
+
+ALL_IN_DIR = STRATEGY_DIR / "all_in"
+EQUAL_SPLIT_DIR = STRATEGY_DIR / "equal_split"
+GREEDY_ONE_UNIT_DIR = STRATEGY_DIR / "greedy_one_unit"
 
 STARTING_CAPITAL = 100.0
 
@@ -39,6 +42,7 @@ class Trade:
     sell_date: date
     buy_price: float
     sell_price: float
+    units: float
     capital_start: float
     capital_end: float
 
@@ -63,6 +67,33 @@ class DailyChoice:
     factor: float
 
 
+@dataclass(frozen=True)
+class Opportunity:
+    asset_id: str
+    buy_date: date
+    sell_date: date
+    buy_price: float
+    sell_price: float
+    gain_pct: float
+
+
+@dataclass(frozen=True)
+class StrategyOutputs:
+    daily_path: Path
+    trades_path: Path
+    summary_path: Path
+
+
+@dataclass(frozen=True)
+class DailySummary:
+    day: date
+    capital_start: float
+    capital_end: float
+    invested: float
+    cash_left: float
+    trade_count: int
+
+
 def main() -> None:
     if not CURRENCY_INPUT.exists() or not ITEMS_INPUT.exists():
         raise FileNotFoundError(
@@ -70,8 +101,11 @@ def main() -> None:
         )
 
     STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
+    ALL_IN_DIR.mkdir(parents=True, exist_ok=True)
+    EQUAL_SPLIT_DIR.mkdir(parents=True, exist_ok=True)
+    GREEDY_ONE_UNIT_DIR.mkdir(parents=True, exist_ok=True)
 
-    dates = build_dates()
+    dates = build_dates(START_DATE, FIRST_WEEK_END)
 
     currency_prices, currency_meta = load_currency_prices(CURRENCY_INPUT)
     item_prices, item_meta = load_item_prices(ITEMS_INPUT)
@@ -85,11 +119,35 @@ def main() -> None:
     meta_map.update(item_meta)
 
     best_daily = compute_best_daily_choices(dates, price_map, meta_map)
-    trades, final_capital = simulate_strategy(dates, best_daily, price_map)
+    opportunities = build_opportunities(dates, price_map)
 
-    write_daily_choices(best_daily, meta_map)
-    write_trades(trades, meta_map)
-    write_summary(final_capital)
+    write_best_daily_choices(best_daily, meta_map)
+
+    strategies = {
+        "all_in": StrategyOutputs(
+            daily_path=ALL_IN_DIR / "daily.csv",
+            trades_path=ALL_IN_DIR / "trades.csv",
+            summary_path=ALL_IN_DIR / "summary.csv",
+        ),
+        "equal_split": StrategyOutputs(
+            daily_path=EQUAL_SPLIT_DIR / "daily.csv",
+            trades_path=EQUAL_SPLIT_DIR / "trades.csv",
+            summary_path=EQUAL_SPLIT_DIR / "summary.csv",
+        ),
+        "greedy_one_unit": StrategyOutputs(
+            daily_path=GREEDY_ONE_UNIT_DIR / "daily.csv",
+            trades_path=GREEDY_ONE_UNIT_DIR / "trades.csv",
+            summary_path=GREEDY_ONE_UNIT_DIR / "summary.csv",
+        ),
+    }
+
+    for strategy_name, outputs in strategies.items():
+        daily_summaries, trades, ending_capital = simulate_daily_strategy(
+            dates, opportunities, strategy_name
+        )
+        write_daily_summary(outputs.daily_path, daily_summaries)
+        write_trades(outputs.trades_path, trades, meta_map)
+        write_summary(outputs.summary_path, trades, ending_capital)
 
 
 # ----------------------------
@@ -127,6 +185,7 @@ def load_currency_prices(
                     "League": league,
                     "Get": get,
                     "Pay": "Chaos Orb",
+                    "Name": get,
                 },
             )
 
@@ -143,6 +202,8 @@ def load_item_prices(
     with open(path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle, delimiter=CSV_DELIMITER)
         for row in reader:
+            if row["Type"] == "BaseType":
+                continue
             row_date = date.fromisoformat(row["Date"])
             key = (
                 row["League"],
@@ -225,108 +286,214 @@ def compute_best_daily_choices(
     return best
 
 
-def simulate_strategy(
+def build_opportunities(
     dates: List[date],
-    daily_choices: Dict[date, DailyChoice],
     prices: Dict[str, Dict[date, float]],
-) -> Tuple[List[Trade], float]:
+) -> Dict[date, List[Opportunity]]:
+    opportunities: Dict[date, List[Opportunity]] = {}
+
+    for asset_id, series in prices.items():
+        for idx in range(len(dates) - 1):
+            day = dates[idx]
+            next_day = dates[idx + 1]
+            if day not in series or next_day not in series:
+                continue
+            buy_price = series[day]
+            sell_price = series[next_day]
+            if buy_price <= 0 or sell_price <= buy_price:
+                continue
+            gain_pct = (sell_price - buy_price) / buy_price
+            opportunities.setdefault(day, []).append(
+                Opportunity(
+                    asset_id=asset_id,
+                    buy_date=day,
+                    sell_date=next_day,
+                    buy_price=buy_price,
+                    sell_price=sell_price,
+                    gain_pct=gain_pct,
+                )
+            )
+
+    return opportunities
+
+
+def simulate_daily_strategy(
+    dates: List[date],
+    opportunities: Dict[date, List[Opportunity]],
+    strategy_name: str,
+) -> Tuple[List[DailySummary], List[Trade], float]:
     capital = STARTING_CAPITAL
     trades: List[Trade] = []
-
-    open_asset: Optional[str] = None
-    open_buy_date: Optional[date] = None
-    open_buy_price: Optional[float] = None
-    open_units: Optional[float] = None
-    open_capital: Optional[float] = None
+    summaries: List[DailySummary] = []
 
     for idx in range(len(dates) - 1):
         day = dates[idx]
-        choice = daily_choices[day]
-        next_day = dates[idx + 1]
+        daily_opps = opportunities.get(day, [])
+        if strategy_name == "all_in":
+            day_trades, cash_left = allocate_all_in(daily_opps, capital)
+        elif strategy_name == "equal_split":
+            day_trades, cash_left = allocate_equal_split(daily_opps, capital)
+        elif strategy_name == "greedy_one_unit":
+            day_trades, cash_left = allocate_greedy_one_unit(daily_opps, capital)
+        else:
+            raise ValueError(f"Unknown strategy {strategy_name}")
 
-        if choice.asset_id != open_asset:
-            if open_asset is not None:
-                sell_price = prices[open_asset][day]
-                capital = open_units * sell_price
-                trades.append(
-                    Trade(
-                        asset_id=open_asset,
-                        asset_type="",
-                        buy_date=open_buy_date,
-                        sell_date=day,
-                        buy_price=open_buy_price,
-                        sell_price=sell_price,
-                        capital_start=open_capital,
-                        capital_end=capital,
-                    )
-                )
-                open_asset = None
-                open_buy_date = None
-                open_buy_price = None
-                open_units = None
-                open_capital = None
+        invested = sum(trade.capital_start for trade in day_trades)
+        proceeds = sum(trade.capital_end for trade in day_trades)
+        capital_next = cash_left + proceeds
 
-            if choice.asset_id is not None:
-                open_asset = choice.asset_id
-                open_buy_date = day
-                open_buy_price = prices[open_asset][day]
-                open_units = capital / open_buy_price
-                open_capital = capital
-
-        if choice.asset_id is None:
-            continue
-
-    if open_asset is not None:
-        final_day = dates[-1]
-        sell_price = prices[open_asset][final_day]
-        capital = open_units * sell_price
-        trades.append(
-            Trade(
-                asset_id=open_asset,
-                asset_type="",
-                buy_date=open_buy_date,
-                sell_date=final_day,
-                buy_price=open_buy_price,
-                sell_price=sell_price,
-                capital_start=open_capital,
-                capital_end=capital,
+        summaries.append(
+            DailySummary(
+                day=day,
+                capital_start=capital,
+                capital_end=capital_next,
+                invested=invested,
+                cash_left=cash_left,
+                trade_count=len(day_trades),
             )
         )
+        trades.extend(day_trades)
+        capital = capital_next
 
-    return trades, capital
+    return summaries, trades, capital
+
+
+def allocate_all_in(
+    opportunities: List[Opportunity],
+    capital: float,
+) -> Tuple[List[Trade], float]:
+    if not opportunities:
+        return [], capital
+    best = max(opportunities, key=lambda opp: opp.gain_pct)
+    units = capital / best.buy_price
+    trade = Trade(
+        asset_id=best.asset_id,
+        asset_type="",
+        buy_date=best.buy_date,
+        sell_date=best.sell_date,
+        buy_price=best.buy_price,
+        sell_price=best.sell_price,
+        units=units,
+        capital_start=capital,
+        capital_end=units * best.sell_price,
+    )
+    return [trade], 0.0
+
+
+def allocate_equal_split(
+    opportunities: List[Opportunity],
+    capital: float,
+) -> Tuple[List[Trade], float]:
+    if not opportunities:
+        return [], capital
+    allocation = capital / len(opportunities)
+    trades: List[Trade] = []
+    for opp in opportunities:
+        units = allocation / opp.buy_price
+        trades.append(
+            Trade(
+                asset_id=opp.asset_id,
+                asset_type="",
+                buy_date=opp.buy_date,
+                sell_date=opp.sell_date,
+                buy_price=opp.buy_price,
+                sell_price=opp.sell_price,
+                units=units,
+                capital_start=allocation,
+                capital_end=units * opp.sell_price,
+            )
+        )
+    return trades, 0.0
+
+
+def allocate_greedy_one_unit(
+    opportunities: List[Opportunity],
+    capital: float,
+) -> Tuple[List[Trade], float]:
+    if not opportunities:
+        return [], capital
+    remaining = capital
+    trades: List[Trade] = []
+    for opp in sorted(opportunities, key=lambda item: item.gain_pct, reverse=True):
+        if opp.buy_price > remaining:
+            continue
+        remaining -= opp.buy_price
+        trades.append(
+            Trade(
+                asset_id=opp.asset_id,
+                asset_type="",
+                buy_date=opp.buy_date,
+                sell_date=opp.sell_date,
+                buy_price=opp.buy_price,
+                sell_price=opp.sell_price,
+                units=1.0,
+                capital_start=opp.buy_price,
+                capital_end=opp.sell_price,
+            )
+        )
+    return trades, remaining
 
 
 # ----------------------------
 # Outputs
 # ----------------------------
 
-def write_daily_choices(choices: Dict[date, DailyChoice], meta: Dict[str, AssetMeta]) -> None:
+def write_best_daily_choices(choices: Dict[date, DailyChoice], meta: Dict[str, AssetMeta]) -> None:
     fieldnames = [
         "Date",
         "AssetId",
         "AssetType",
+        "Name",
+        "BaseType",
         "BuyPrice",
         "SellPrice",
         "Factor",
     ]
-    with open(STRATEGY_DAILY_OUTPUT, "w", newline="", encoding="utf-8") as handle:
+    with open(BEST_DAILY_OUTPUT, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for day in sorted(choices.keys()):
             choice = choices[day]
+            asset_fields = meta[choice.asset_id].fields if choice.asset_id in meta else {}
             writer.writerow(
                 {
                     "Date": day.isoformat(),
                     "AssetId": choice.asset_id or "",
                     "AssetType": choice.asset_type or "",
+                    "Name": asset_fields.get("Name", ""),
+                    "BaseType": asset_fields.get("BaseType", ""),
                     "BuyPrice": round(choice.buy_price, 6) if choice.buy_price is not None else "",
                     "SellPrice": round(choice.sell_price, 6) if choice.sell_price is not None else "",
                     "Factor": round(choice.factor, 6),
                 }
             )
 
+def write_daily_summary(path: Path, summaries: List[DailySummary]) -> None:
+    fieldnames = [
+        "Date",
+        "CapitalStart",
+        "CapitalEnd",
+        "Invested",
+        "CashLeft",
+        "TradeCount",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for summary in summaries:
+            writer.writerow(
+                {
+                    "Date": summary.day.isoformat(),
+                    "CapitalStart": round(summary.capital_start, 6),
+                    "CapitalEnd": round(summary.capital_end, 6),
+                    "Invested": round(summary.invested, 6),
+                    "CashLeft": round(summary.cash_left, 6),
+                    "TradeCount": summary.trade_count,
+                }
+            )
 
-def write_trades(trades: List[Trade], meta: Dict[str, AssetMeta]) -> None:
+
+def write_trades(path: Path, trades: List[Trade], meta: Dict[str, AssetMeta]) -> None:
     fieldnames = [
         "AssetId",
         "AssetType",
@@ -334,6 +501,7 @@ def write_trades(trades: List[Trade], meta: Dict[str, AssetMeta]) -> None:
         "SellDate",
         "BuyPrice",
         "SellPrice",
+        "Units",
         "CapitalStart",
         "CapitalEnd",
         "Gain",
@@ -344,10 +512,11 @@ def write_trades(trades: List[Trade], meta: Dict[str, AssetMeta]) -> None:
         "Id",
         "Type",
         "Name",
+        "BaseType",
         "Variant",
         "Links",
     ]
-    with open(STRATEGY_TRADES_OUTPUT, "w", newline="", encoding="utf-8") as handle:
+    with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for trade in trades:
@@ -361,6 +530,7 @@ def write_trades(trades: List[Trade], meta: Dict[str, AssetMeta]) -> None:
                     "SellDate": trade.sell_date.isoformat(),
                     "BuyPrice": round(trade.buy_price, 6),
                     "SellPrice": round(trade.sell_price, 6),
+                    "Units": round(trade.units, 6),
                     "CapitalStart": round(trade.capital_start, 6),
                     "CapitalEnd": round(trade.capital_end, 6),
                     "Gain": round(trade.gain, 6),
@@ -371,26 +541,51 @@ def write_trades(trades: List[Trade], meta: Dict[str, AssetMeta]) -> None:
                     "Id": fields.get("Id", ""),
                     "Type": fields.get("Type", ""),
                     "Name": fields.get("Name", ""),
+                    "BaseType": fields.get("BaseType", ""),
                     "Variant": fields.get("Variant", ""),
                     "Links": fields.get("Links", ""),
                 }
             )
 
 
-def write_summary(final_capital: float) -> None:
-    fieldnames = ["StartingCapital", "EndingCapital", "TotalReturnPct"]
+def write_summary(path: Path, trades: List[Trade], final_capital: float) -> None:
+    fieldnames = [
+        "WindowStart",
+        "WindowEnd",
+        "StartingCapital",
+        "EndingCapital",
+        "TotalReturnPct",
+        "TradeCount",
+        "AvgGainPct",
+        "MedianGainPct",
+    ]
+    gain_pcts = sorted(trade.gain_pct for trade in trades)
+    avg_gain = sum(gain_pcts) / len(gain_pcts) if gain_pcts else 0.0
+    median_gain = 0.0
+    if gain_pcts:
+        mid = len(gain_pcts) // 2
+        if len(gain_pcts) % 2 == 1:
+            median_gain = gain_pcts[mid]
+        else:
+            median_gain = (gain_pcts[mid - 1] + gain_pcts[mid]) / 2
+
     total_return = 0.0
     if STARTING_CAPITAL > 0:
         total_return = (final_capital - STARTING_CAPITAL) / STARTING_CAPITAL
 
-    with open(STRATEGY_SUMMARY_OUTPUT, "w", newline="", encoding="utf-8") as handle:
+    with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow(
             {
+                "WindowStart": START_DATE.isoformat(),
+                "WindowEnd": FIRST_WEEK_END.isoformat(),
                 "StartingCapital": round(STARTING_CAPITAL, 6),
                 "EndingCapital": round(final_capital, 6),
                 "TotalReturnPct": round(total_return, 6),
+                "TradeCount": len(trades),
+                "AvgGainPct": round(avg_gain, 6),
+                "MedianGainPct": round(median_gain, 6),
             }
         )
 
@@ -399,10 +594,10 @@ def write_summary(final_capital: float) -> None:
 # Utility
 # ----------------------------
 
-def build_dates() -> List[date]:
+def build_dates(start: date, end: date) -> List[date]:
     dates: List[date] = []
-    current = START_DATE
-    while current <= END_DATE:
+    current = start
+    while current <= end:
         dates.append(current)
         current += timedelta(days=1)
     return dates
